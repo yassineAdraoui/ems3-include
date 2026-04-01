@@ -1,0 +1,5 @@
+{
+  "name": "Domain Extractor",
+  "description": "Extract root domains from a list of subdomains and download the results as a text file.",
+  "requestFramePermissions": []
+}
