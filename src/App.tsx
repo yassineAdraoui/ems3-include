@@ -10,7 +10,7 @@ import { motion, AnimatePresence } from 'motion/react';
 import axios from 'axios';
 
 // --- Types ---
-type Page = 'extractor' | 'spf' | 'dns-spf' | 'root-extractor';
+type Page = 'extractor' | 'spf' | 'dns-spf' | 'root-extractor' | 'includes-search';
 
 interface SPFResult {
   domain: string;
@@ -176,6 +176,166 @@ const RootDomainExtractor = ({ onExtract }: { onExtract: (domains: string[]) => 
               {results.map((domain, i) => (
                 <div key={i} className="text-xs font-mono text-gray-600 truncate py-1 border-b border-gray-100 last:border-0">
                   {domain}
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+const IncludesSearch = ({ onExtract }: { onExtract: (domains: string[]) => void }) => {
+  const [input, setInput] = useState('');
+  const [searchTerm, setSearchTerm] = useState('');
+  const [results, setResults] = useState<string[]>([]);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [copyFeedback, setCopyFeedback] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const content = event.target?.result as string;
+      setInput(prev => prev ? `${prev}\n${content}` : content);
+    };
+    reader.readAsText(file);
+    if (fileInputRef.current) fileInputRef.current.value = '';
+  };
+
+  const searchIncludes = () => {
+    if (!searchTerm.trim()) return;
+    setIsProcessing(true);
+    setTimeout(() => {
+      const lines = input.split('\n');
+      const matchingDomains = new Set<string>();
+      const target = searchTerm.trim().toLowerCase();
+      
+      lines.forEach(line => {
+        const trimmed = line.trim();
+        if (!trimmed) return;
+        
+        if (trimmed.toLowerCase().includes(target)) {
+          // Try to extract domain if format is domain:record or domain:"record"
+          if (trimmed.includes(':')) {
+             const parts = trimmed.split(':');
+             let domain = parts[0].trim();
+             // Clean potential quotes
+             domain = domain.replace(/^["']|["']$/g, '');
+             if (domain && domain.includes('.')) {
+               matchingDomains.add(domain);
+             } else {
+               matchingDomains.add(trimmed);
+             }
+          } else {
+            matchingDomains.add(trimmed);
+          }
+        }
+      });
+      
+      setResults(Array.from(matchingDomains).sort());
+      setIsProcessing(false);
+    }, 300);
+  };
+
+  const copyResults = () => {
+    navigator.clipboard.writeText(results.join('\n'));
+    setCopyFeedback(true);
+    setTimeout(() => setCopyFeedback(false), 2000);
+  };
+
+  const downloadResults = () => {
+    const timestamp = new Date().toISOString().split('T')[0];
+    const file = new Blob([results.join('\n')], { type: 'text/plain' });
+    const url = URL.createObjectURL(file);
+    const a = document.createElement('a');
+    a.href = url; a.download = `includes_search_${searchTerm}_${timestamp}.txt`;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  };
+
+  return (
+    <div className="space-y-6">
+      <div className="bg-white rounded-2xl p-6 shadow-sm border border-gray-100">
+        <div className="flex items-center justify-between mb-4">
+          <label className="text-sm font-medium flex items-center gap-2">
+            <Search className="w-4 h-4 text-teal-600" />
+            Includes Search
+          </label>
+          <div className="flex gap-3">
+            <button 
+              onClick={() => fileInputRef.current?.click()}
+              className="text-xs text-teal-600 hover:text-teal-700 flex items-center gap-1 transition-colors"
+            >
+              <Upload className="w-3 h-3" />
+              Upload .txt
+            </button>
+            <input type="file" ref={fileInputRef} accept=".txt" className="hidden" onChange={handleFileUpload} />
+            <button onClick={() => { setInput(''); setResults([]); setSearchTerm(''); }} className="text-xs text-red-500 hover:text-red-600 flex items-center gap-1 transition-colors">
+              <Trash2 className="w-3 h-3" />
+              Clear
+            </button>
+          </div>
+        </div>
+        
+        <div className="mb-4">
+          <input
+            type="text"
+            className="w-full p-3 bg-gray-50 border border-gray-200 rounded-xl focus:ring-2 focus:ring-teal-500 focus:border-transparent transition-all outline-none text-sm"
+            placeholder="Enter domain to search for in includes (e.g. spf.google.com)"
+            value={searchTerm}
+            onChange={(e) => setSearchTerm(e.target.value)}
+          />
+        </div>
+
+        <textarea
+          className="w-full h-48 p-4 bg-gray-50 border border-gray-200 rounded-xl focus:ring-2 focus:ring-teal-500 focus:border-transparent transition-all resize-none font-mono text-sm outline-none"
+          placeholder='Paste records here...&#10;example.com:"v=spf1 include:spf.google.com ~all"'
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+        />
+        <button
+          onClick={searchIncludes}
+          disabled={!input.trim() || !searchTerm.trim() || isProcessing}
+          className="w-full mt-4 bg-teal-600 hover:bg-teal-700 disabled:bg-gray-300 text-white font-medium py-3 rounded-xl transition-all shadow-lg shadow-teal-200 flex items-center justify-center gap-2"
+        >
+          {isProcessing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Search className="w-4 h-4" />}
+          {isProcessing ? 'Searching...' : 'Search Includes'}
+        </button>
+      </div>
+
+      {results.length > 0 && (
+        <div className="bg-white rounded-2xl p-6 shadow-sm border border-gray-100">
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="text-sm font-medium flex items-center gap-2">
+              <CheckCircle2 className="w-4 h-4 text-green-500" />
+              Matching Domains ({results.length})
+            </h2>
+            <div className="flex gap-3">
+              <button onClick={copyResults} className="text-xs text-purple-600 hover:text-purple-700 flex items-center gap-1 relative">
+                <Copy className="w-3 h-3" />
+                {copyFeedback ? 'Copied!' : 'Copy Results'}
+              </button>
+              <button onClick={downloadResults} className="text-xs text-blue-600 hover:text-blue-700 flex items-center gap-1">
+                <Download className="w-3 h-3" />
+                Download .txt
+              </button>
+              <button
+                onClick={() => onExtract(results)}
+                className="text-xs text-green-600 hover:text-green-700 flex items-center gap-1"
+              >
+                <Globe className="w-3 h-3" />
+                Send to Extractor
+              </button>
+            </div>
+          </div>
+          <div className="max-h-64 overflow-y-auto bg-gray-50 rounded-xl p-4 border border-gray-200">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+              {results.map((d, i) => (
+                <div key={i} className="text-xs font-mono text-gray-600 truncate py-1 border-b border-gray-100 last:border-0">
+                  {d}
                 </div>
               ))}
             </div>
@@ -1074,6 +1234,12 @@ export default function App() {
             >
               Root Extractor
             </button>
+            <button
+              onClick={() => setCurrentPage('includes-search')}
+              className={`px-4 py-2 rounded-lg text-sm font-medium transition-all whitespace-nowrap ${currentPage === 'includes-search' ? 'bg-teal-600 text-white shadow-md' : 'text-gray-500 hover:text-gray-700'}`}
+            >
+              Includes Search
+            </button>
           </nav>
         </header>
 
@@ -1107,6 +1273,14 @@ export default function App() {
               {currentPage === 'dns-spf' && <DNSSPFChecker onExtractFromSPF={extractDomainsFromSPFResults} />}
               {currentPage === 'root-extractor' && (
                 <RootDomainExtractor 
+                  onExtract={(domains) => {
+                    setInput(prev => prev ? `${prev}\n${domains.join('\n')}` : domains.join('\n'));
+                    setCurrentPage('extractor');
+                  }} 
+                />
+              )}
+              {currentPage === 'includes-search' && (
+                <IncludesSearch 
                   onExtract={(domains) => {
                     setInput(prev => prev ? `${prev}\n${domains.join('\n')}` : domains.join('\n'));
                     setCurrentPage('extractor');
