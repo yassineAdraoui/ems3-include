@@ -1,5 +1,5 @@
 {
   "name": "Domain Extractor",
-  "description": "Extract root domains from a list of subdomains and download the results as a text file.",
+  "description": "Extract root domains, check SPF records, and search for included domains with Google Sheets export.",
   "requestFramePermissions": []
 }

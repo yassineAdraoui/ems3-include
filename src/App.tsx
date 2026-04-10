@@ -5,12 +5,12 @@
 
 import React, { useState, useCallback, useRef, useEffect } from 'react';
 import psl from 'psl';
-import { Download, Copy, Trash2, Globe, FileText, CheckCircle2, AlertCircle, Upload, ShieldCheck, Search, Loader2, ExternalLink } from 'lucide-react';
+import { Download, Copy, Trash2, Globe, FileText, CheckCircle2, AlertCircle, Upload, ShieldCheck, Search, Loader2, ExternalLink, TableProperties, LogOut } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import axios from 'axios';
 
 // --- Types ---
-type Page = 'extractor' | 'spf' | 'dns-spf' | 'root-extractor' | 'includes-search';
+type Page = 'extractor' | 'spf' | 'dns-spf' | 'root-extractor' | 'includes-search' | 'whois-search';
 
 interface SPFResult {
   domain: string;
@@ -192,7 +192,97 @@ const IncludesSearch = ({ onExtract }: { onExtract: (domains: string[]) => void 
   const [results, setResults] = useState<string[]>([]);
   const [isProcessing, setIsProcessing] = useState(false);
   const [copyFeedback, setCopyFeedback] = useState(false);
+  const [isGoogleAuthenticated, setIsGoogleAuthenticated] = useState(false);
+  const [isExporting, setIsExporting] = useState(false);
+  const [exportFeedback, setExportFeedback] = useState<{ type: 'success' | 'error', message: string, url?: string } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    checkGoogleAuth();
+    
+    const handleMessage = (event: MessageEvent) => {
+      if (event.data?.type === 'GOOGLE_AUTH_SUCCESS') {
+        setIsGoogleAuthenticated(true);
+      }
+    };
+    window.addEventListener('message', handleMessage);
+    return () => window.removeEventListener('message', handleMessage);
+  }, []);
+
+  const checkGoogleAuth = async () => {
+    try {
+      const response = await axios.get('/api/auth/google/status');
+      setIsGoogleAuthenticated(response.data.isAuthenticated);
+    } catch (error) {
+      console.error('Error checking Google auth status:', error);
+    }
+  };
+
+  const handleGoogleLogin = async () => {
+    try {
+      const response = await axios.get('/api/auth/google/url');
+      const { url } = response.data;
+      window.open(url, 'google_auth_popup', 'width=600,height=700');
+    } catch (error) {
+      console.error('Error getting Google auth URL:', error);
+    }
+  };
+
+  const handleGoogleLogout = async () => {
+    try {
+      await axios.post('/api/auth/google/logout');
+      setIsGoogleAuthenticated(false);
+    } catch (error) {
+      console.error('Error logging out from Google:', error);
+    }
+  };
+
+  const exportToSheets = async () => {
+    if (!isGoogleAuthenticated) {
+      handleGoogleLogin();
+      return;
+    }
+
+    setIsExporting(true);
+    setExportFeedback(null);
+
+    try {
+      // 1. Create a new Spreadsheet
+      const createResponse = await axios.post('/api/sheets/create', {
+        title: `SPF Search Results - ${new Date().toLocaleString()}`
+      });
+      
+      const { spreadsheetId, spreadsheetUrl } = createResponse.data;
+
+      // 2. Format results for Google Sheets: [domaine PROD, mechanism, Domaine racine]
+      // Current format in state: "rootDomain | mechanism | includedValue"
+      const values = results.map(r => {
+        const [rootDomain, mechanism, includedValue] = r.split(' | ');
+        return [includedValue, mechanism, rootDomain];
+      });
+
+      // 3. Append values
+      await axios.post('/api/sheets/append', {
+        spreadsheetId,
+        values
+      });
+
+      setExportFeedback({ 
+        type: 'success', 
+        message: 'Successfully created and exported to Google Sheets!',
+        url: spreadsheetUrl
+      });
+      setTimeout(() => setExportFeedback(null), 10000);
+    } catch (error: any) {
+      console.error('Error exporting to Google Sheets:', error);
+      setExportFeedback({ 
+        type: 'error', 
+        message: error.response?.data?.error || 'Failed to export to Google Sheets' 
+      });
+    } finally {
+      setIsExporting(false);
+    }
+  };
 
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -211,32 +301,36 @@ const IncludesSearch = ({ onExtract }: { onExtract: (domains: string[]) => void 
     setIsProcessing(true);
     setTimeout(() => {
       const lines = input.split('\n');
-      const matchingDomains = new Set<string>();
-      const target = searchTerm.trim().toLowerCase();
+      const searchDomains = searchTerm.split(/[\n,; ]+/).map(d => d.trim().toLowerCase()).filter(d => d);
+      const matchingLines = new Set<string>();
       
       lines.forEach(line => {
         const trimmed = line.trim();
         if (!trimmed) return;
         
-        if (trimmed.toLowerCase().includes(target)) {
-          // Try to extract domain if format is domain:record or domain:"record"
-          if (trimmed.includes(':')) {
-             const parts = trimmed.split(':');
-             let domain = parts[0].trim();
-             // Clean potential quotes
-             domain = domain.replace(/^["']|["']$/g, '');
-             if (domain && domain.includes('.')) {
-               matchingDomains.add(domain);
-             } else {
-               matchingDomains.add(trimmed);
-             }
-          } else {
-            matchingDomains.add(trimmed);
+        // Extract root domain from line (format is usually domain:"record" or domain:record)
+        let rootDomain = '';
+        if (trimmed.includes(':')) {
+          rootDomain = trimmed.split(':')[0].trim().replace(/^["']|["']$/g, '');
+        } else {
+          rootDomain = trimmed.split(' ')[0].trim();
+        }
+
+        // Regex to find mechanisms and their values
+        const regex = /(include|a|mx|ptr|exists|ip4|ip6):([^\s]+)/gi;
+        let match;
+        while ((match = regex.exec(trimmed)) !== null) {
+          const mechanism = match[1].toLowerCase();
+          const includedValue = match[2].replace(/[;,"']$/, '').toLowerCase();
+          
+          // Check if includedValue matches any of our searchDomains
+          if (searchDomains.some(sd => includedValue.includes(sd))) {
+            matchingLines.add(`${rootDomain} | ${mechanism} | ${includedValue}`);
           }
         }
       });
       
-      setResults(Array.from(matchingDomains).sort());
+      setResults(Array.from(matchingLines).sort());
       setIsProcessing(false);
     }, 300);
   };
@@ -252,7 +346,7 @@ const IncludesSearch = ({ onExtract }: { onExtract: (domains: string[]) => void 
     const file = new Blob([results.join('\n')], { type: 'text/plain' });
     const url = URL.createObjectURL(file);
     const a = document.createElement('a');
-    a.href = url; a.download = `includes_search_${searchTerm}_${timestamp}.txt`;
+    a.href = url; a.download = `includes_search_results_${timestamp}.txt`;
     document.body.appendChild(a); a.click(); document.body.removeChild(a);
   };
 
@@ -262,7 +356,7 @@ const IncludesSearch = ({ onExtract }: { onExtract: (domains: string[]) => void 
         <div className="flex items-center justify-between mb-4">
           <label className="text-sm font-medium flex items-center gap-2">
             <Search className="w-4 h-4 text-teal-600" />
-            Includes Search
+            Includes Search (Bulk)
           </label>
           <div className="flex gap-3">
             <button 
@@ -281,10 +375,9 @@ const IncludesSearch = ({ onExtract }: { onExtract: (domains: string[]) => void 
         </div>
         
         <div className="mb-4">
-          <input
-            type="text"
-            className="w-full p-3 bg-gray-50 border border-gray-200 rounded-xl focus:ring-2 focus:ring-teal-500 focus:border-transparent transition-all outline-none text-sm"
-            placeholder="Enter domain to search for in includes (e.g. spf.google.com)"
+          <textarea
+            className="w-full h-24 p-3 bg-gray-50 border border-gray-200 rounded-xl focus:ring-2 focus:ring-teal-500 focus:border-transparent transition-all outline-none text-sm resize-none font-mono"
+            placeholder="Enter domains to search for in includes (one per line)...&#10;e.g. spf.google.com&#10;spf.protection.outlook.com"
             value={searchTerm}
             onChange={(e) => setSearchTerm(e.target.value)}
           />
@@ -311,13 +404,26 @@ const IncludesSearch = ({ onExtract }: { onExtract: (domains: string[]) => void 
           <div className="flex items-center justify-between mb-4">
             <h2 className="text-sm font-medium flex items-center gap-2">
               <CheckCircle2 className="w-4 h-4 text-green-500" />
-              Matching Domains ({results.length})
+              Matching Results ({results.length})
             </h2>
             <div className="flex gap-3">
               <button onClick={copyResults} className="text-xs text-purple-600 hover:text-purple-700 flex items-center gap-1 relative">
                 <Copy className="w-3 h-3" />
                 {copyFeedback ? 'Copied!' : 'Copy Results'}
               </button>
+              <button 
+                onClick={exportToSheets} 
+                disabled={isExporting}
+                className={`text-xs flex items-center gap-1 transition-colors ${isGoogleAuthenticated ? 'text-green-600 hover:text-green-700' : 'text-blue-600 hover:text-blue-700'}`}
+              >
+                {isExporting ? <Loader2 className="w-3 h-3 animate-spin" /> : <TableProperties className="w-3 h-3" />}
+                {isGoogleAuthenticated ? 'Export to Sheets' : 'Connect Google Sheets'}
+              </button>
+              {isGoogleAuthenticated && (
+                <button onClick={handleGoogleLogout} className="text-xs text-gray-400 hover:text-red-500 transition-colors" title="Logout from Google">
+                  <LogOut className="w-3 h-3" />
+                </button>
+              )}
               <button onClick={downloadResults} className="text-xs text-blue-600 hover:text-blue-700 flex items-center gap-1">
                 <Download className="w-3 h-3" />
                 Download .txt
@@ -331,13 +437,45 @@ const IncludesSearch = ({ onExtract }: { onExtract: (domains: string[]) => void 
               </button>
             </div>
           </div>
+
+          {exportFeedback && (
+            <motion.div 
+              initial={{ opacity: 0, y: -10 }}
+              animate={{ opacity: 1, y: 0 }}
+              className={`mb-4 p-3 rounded-xl text-xs flex items-center gap-2 ${exportFeedback.type === 'success' ? 'bg-green-50 text-green-700 border border-green-100' : 'bg-red-50 text-red-700 border border-red-100'}`}
+            >
+              {exportFeedback.type === 'success' ? <CheckCircle2 className="w-4 h-4" /> : <AlertCircle className="w-4 h-4" />}
+              {exportFeedback.message}
+              {exportFeedback.url && (
+                <a 
+                  href={exportFeedback.url} 
+                  target="_blank" 
+                  rel="noopener noreferrer"
+                  className="ml-auto underline flex items-center gap-1"
+                >
+                  Open Sheet <ExternalLink className="w-3 h-3" />
+                </a>
+              )}
+            </motion.div>
+          )}
+
           <div className="max-h-64 overflow-y-auto bg-gray-50 rounded-xl p-4 border border-gray-200">
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
-              {results.map((d, i) => (
-                <div key={i} className="text-xs font-mono text-gray-600 truncate py-1 border-b border-gray-100 last:border-0">
-                  {d}
-                </div>
-              ))}
+            <div className="grid grid-cols-1 gap-2">
+              <div className="grid grid-cols-3 gap-4 text-[10px] uppercase tracking-wider font-bold text-gray-400 border-b pb-2 mb-2">
+                <div>Domaine Racine</div>
+                <div>Mechanism</div>
+                <div>Domaines Include</div>
+              </div>
+              {results.map((d, i) => {
+                const parts = d.split(' | ');
+                return (
+                  <div key={i} className="grid grid-cols-3 gap-4 text-xs font-mono text-gray-600 py-1 border-b border-gray-100 last:border-0">
+                    <div className="truncate">{parts[0]}</div>
+                    <div className="text-teal-600 font-medium">{parts[1]}</div>
+                    <div className="truncate">{parts[2]}</div>
+                  </div>
+                );
+              })}
             </div>
           </div>
         </div>
@@ -637,8 +775,8 @@ const DomainExtractor = ({
           <div className="flex items-start gap-3 border-t border-blue-100 pt-3">
             <ShieldCheck className="w-5 h-5 text-amber-500 mt-0.5" />
             <div className="text-xs text-amber-800 space-y-1">
-              <p className="font-semibold">Namecheap API Note:</p>
-              <p>Ensure your IP is whitelisted in your Namecheap account. Sandbox usually requires whitelisting even for testing.</p>
+              <p className="font-semibold">Namecrawl API Note:</p>
+              <p>Domain availability check is powered by Namecrawl.dev API.</p>
             </div>
           </div>
           {results.length > 5000 && (
@@ -672,7 +810,7 @@ const DomainExtractor = ({
                 className="flex items-center gap-1.5 px-3 py-1.5 bg-amber-50 text-amber-700 hover:bg-amber-100 rounded-lg text-xs font-medium transition-colors disabled:opacity-50"
               >
                 {isCheckingNamecheap ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ShieldCheck className="w-3.5 h-3.5" />}
-                Namecheap Check
+                Namecrawl Check
               </button>
               <button
                 onClick={copyToClipboard}
@@ -709,7 +847,7 @@ const DomainExtractor = ({
             <div className="mb-4 p-3 bg-red-50 border border-red-100 rounded-xl flex items-start gap-2 text-red-700 text-[10px]">
               <AlertCircle className="w-3.5 h-3.5 mt-0.5 shrink-0" />
               <div>
-                <p className="font-bold">Namecheap Check Failed</p>
+                <p className="font-bold">Namecrawl Check Failed</p>
                 <p>{namecheapError}</p>
               </div>
             </div>
@@ -1015,6 +1153,216 @@ const SPFChecker = ({ onExtractFromSPF }: { onExtractFromSPF: (results: SPFResul
 
 // --- Main App ---
 
+const WhoisSearch = () => {
+  const [input, setInput] = useState('');
+  const [results, setResults] = useState<any[]>([]);
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [showRaw, setShowRaw] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const content = event.target?.result as string;
+      setInput(prev => prev ? `${prev}\n${content}` : content);
+    };
+    reader.readAsText(file);
+    if (fileInputRef.current) fileInputRef.current.value = '';
+  };
+
+  const performWhois = async () => {
+    const domains = input.split(/[\n,; ]+/).map(d => d.trim().toLowerCase()).filter(d => d);
+    if (domains.length === 0) return;
+
+    setIsLoading(true);
+    setError(null);
+    setResults([]);
+    setProgress(0);
+
+    const newResults: any[] = [];
+    
+    for (let i = 0; i < domains.length; i++) {
+      const domain = domains[i];
+      try {
+        const response = await axios.get('/api/whois', { params: { domain } });
+        newResults.push(response.data);
+      } catch (err: any) {
+        newResults.push({
+          domain,
+          error: err.response?.data?.error || err.message || 'Lookup failed',
+          details: err.response?.data?.details
+        });
+      }
+      setResults([...newResults]);
+      setProgress(Math.round(((i + 1) / domains.length) * 100));
+      
+      // Small delay to avoid rate limiting
+      if (domains.length > 1) {
+        await new Promise(resolve => setTimeout(resolve, 300));
+      }
+    }
+    
+    setIsLoading(false);
+  };
+
+  const downloadResults = () => {
+    const csvContent = [
+      ['Domain', 'Status', 'Registrar', 'Registration Date', 'Expiration Date', 'Nameservers'].join(','),
+      ...results.map(r => [
+        r.domain,
+        r.available ? 'Available' : 'Registered',
+        `"${(r.details?.entities || '').replace(/"/g, '""')}"`,
+        r.details?.registrationDate || 'N/A',
+        r.details?.expirationDate || 'N/A',
+        `"${(r.details?.nameservers || '').replace(/"/g, '""')}"`
+      ].join(','))
+    ].join('\n');
+
+    const blob = new Blob([csvContent], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `whois_results_${new Date().toISOString().split('T')[0]}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  };
+
+  return (
+    <div className="space-y-6">
+      <div className="bg-white rounded-2xl p-6 shadow-sm border border-gray-100">
+        <div className="flex items-center justify-between mb-4">
+          <label className="text-sm font-medium flex items-center gap-2">
+            <Search className="w-4 h-4 text-indigo-600" />
+            Bulk WHOIS / RDAP Lookup
+          </label>
+          <div className="flex gap-3">
+            <button 
+              onClick={() => fileInputRef.current?.click()}
+              className="text-xs text-indigo-600 hover:text-indigo-700 flex items-center gap-1 transition-colors"
+            >
+              <Upload className="w-3 h-3" />
+              Upload .txt
+            </button>
+            <input type="file" ref={fileInputRef} accept=".txt" className="hidden" onChange={handleFileUpload} />
+            <button onClick={() => { setInput(''); setResults([]); setProgress(0); }} className="text-xs text-red-500 hover:text-red-600 flex items-center gap-1 transition-colors">
+              <Trash2 className="w-3 h-3" />
+              Clear
+            </button>
+          </div>
+        </div>
+        <textarea
+          className="w-full h-32 p-4 bg-gray-50 border border-gray-200 rounded-xl focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 transition-all outline-none font-mono text-sm resize-none"
+          placeholder="Enter domains (one per line, comma or space separated)..."
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+        />
+        <button
+          onClick={performWhois}
+          disabled={isLoading || !input.trim()}
+          className="w-full mt-4 bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-300 text-white font-medium py-3 rounded-xl transition-all flex items-center justify-center gap-2 shadow-lg shadow-indigo-200"
+        >
+          {isLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Search className="w-4 h-4" />}
+          {isLoading ? `Processing... ${progress}%` : 'Start Bulk Lookup'}
+        </button>
+      </div>
+
+      {results.length > 0 && (
+        <div className="bg-white rounded-2xl p-6 shadow-sm border border-gray-100">
+          <div className="flex items-center justify-between mb-6">
+            <h2 className="text-sm font-medium flex items-center gap-2">
+              <TableProperties className="w-4 h-4 text-indigo-600" />
+              Lookup Results ({results.length})
+            </h2>
+            <div className="flex gap-3">
+              <button 
+                onClick={() => setShowRaw(!showRaw)}
+                className="text-[10px] text-gray-400 hover:text-gray-600 underline"
+              >
+                {showRaw ? 'Hide Raw' : 'Show Raw'}
+              </button>
+              <button
+                onClick={downloadResults}
+                className="text-xs text-blue-600 hover:text-blue-700 flex items-center gap-1"
+              >
+                <Download className="w-3 h-3" />
+                Download CSV
+              </button>
+            </div>
+          </div>
+
+          <div className="overflow-x-auto border border-gray-100 rounded-xl">
+            <table className="w-full text-sm text-left">
+              <thead className="text-[10px] uppercase tracking-wider font-bold text-gray-400 bg-gray-50">
+                <tr>
+                  <th className="px-4 py-3">Domain</th>
+                  <th className="px-4 py-3">Status</th>
+                  <th className="px-4 py-3">Registrar</th>
+                  <th className="px-4 py-3">Expiration</th>
+                  <th className="px-4 py-3">Nameservers</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-50">
+                {results.map((res, idx) => (
+                  <tr key={idx} className="hover:bg-gray-50 transition-colors group">
+                    <td className="px-4 py-3 font-mono text-xs font-medium text-gray-700">
+                      <div className="flex items-center gap-2">
+                        {res.domain}
+                        <a 
+                          href={`https://who.is/whois/${res.domain}`} 
+                          target="_blank" 
+                          rel="noopener noreferrer"
+                          className="opacity-0 group-hover:opacity-100 transition-opacity text-indigo-400 hover:text-indigo-600"
+                        >
+                          <ExternalLink className="w-3 h-3" />
+                        </a>
+                      </div>
+                    </td>
+                    <td className="px-4 py-3">
+                      {res.error ? (
+                        <span className="text-[10px] text-red-500 flex items-center gap-1" title={res.details}>
+                          <AlertCircle className="w-3 h-3" /> Error
+                        </span>
+                      ) : res.available ? (
+                        <span className="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-medium bg-green-100 text-green-700">
+                          AVAILABLE
+                        </span>
+                      ) : (
+                        <span className="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-medium bg-blue-100 text-blue-700">
+                          TAKEN
+                        </span>
+                      )}
+                    </td>
+                    <td className="px-4 py-3 text-[11px] text-gray-500 truncate max-w-[150px]">
+                      {res.details?.entities || '-'}
+                    </td>
+                    <td className="px-4 py-3 text-[11px] text-gray-500">
+                      {res.details?.expirationDate ? new Date(res.details.expirationDate).toLocaleDateString() : '-'}
+                    </td>
+                    <td className="px-4 py-3 text-[10px] font-mono text-gray-400 truncate max-w-[150px]">
+                      {res.details?.nameservers || '-'}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          {showRaw && results.length > 0 && (
+            <div className="mt-6 bg-gray-900 text-gray-300 p-4 rounded-xl overflow-auto max-h-96 text-[10px] font-mono">
+              <pre>{JSON.stringify(results, null, 2)}</pre>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
+
 export default function App() {
   const [currentPage, setCurrentPage] = useState<Page>('extractor');
   
@@ -1115,7 +1463,7 @@ export default function App() {
 
     for (const chunk of chunks) {
       try {
-        const response = await axios.get('/api/namecheap-check', {
+        const response = await axios.get('/api/domain-check', {
           params: { domains: chunk.join(',') }
         });
         
@@ -1127,7 +1475,7 @@ export default function App() {
         
         setNamecheapResults({ ...newResults });
       } catch (error: any) {
-        console.error('Error checking Namecheap:', error);
+        console.error('Error checking Namecrawl:', error);
         const errorMsg = error.response?.data?.details || error.response?.data?.error || error.message;
         setNamecheapError(errorMsg);
         break; // Stop on first error
@@ -1240,6 +1588,12 @@ export default function App() {
             >
               Includes Search
             </button>
+            <button
+              onClick={() => setCurrentPage('whois-search')}
+              className={`px-4 py-2 rounded-lg text-sm font-medium transition-all whitespace-nowrap ${currentPage === 'whois-search' ? 'bg-indigo-600 text-white shadow-md' : 'text-gray-500 hover:text-gray-700'}`}
+            >
+              WHOIS Lookup
+            </button>
           </nav>
         </header>
 
@@ -1287,6 +1641,7 @@ export default function App() {
                   }} 
                 />
               )}
+              {currentPage === 'whois-search' && <WhoisSearch />}
             </motion.div>
           </AnimatePresence>
         </main>
